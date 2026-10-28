@@ -6,8 +6,8 @@
 
 **GOAL:** Adreno 618 bring-up on davinci. Patches 0084 (probe) + 0085 (CX power-on / optional AGX stub). See docs/GPU.md. Boot with sweetgpu=2 first; sweetgpu=3 only for selector traces.
 
-**CI:** pushed \gpu-bringup\ to axtodev/ios-davinci (49e1e2\). Workflow run 40772702186 FAILED: account locked for billing - job never started. PR to upstream: https://github.com/Antcating/ios-davinci/pull/2
-**NEXT:** unlock GitHub billing / free Actions on axtodev, re-run \gh workflow run xnu.yml --ref gpu-bringup\, then fastboot boot with sweetgpu=2.
+**CI:** pushed branch gpu-bringup to axtodev/ios-davinci (649e1e2+). Workflow run 40772702186 FAILED: GitHub account locked for billing, job never started. Upstream PR: https://github.com/Antcating/ios-davinci/pull/2
+**NEXT:** unlock GitHub billing / Actions on axtodev, re-run: gh workflow run xnu.yml --ref gpu-bringup. Then fastboot boot with sweetgpu=2.
 
 ---
 
