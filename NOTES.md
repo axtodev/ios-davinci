@@ -2,6 +2,14 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-28 (GPU acceleration - read first) <<<
+
+**GOAL:** Adreno 618 bring-up on davinci. Patches 0084 (probe) + 0085 (CX power-on / optional AGX stub). See docs/GPU.md. Boot with sweetgpu=2 first; sweetgpu=3 only for selector traces.
+
+**NEXT:** CI build 0085, fastboot boot, confirm SWEET GPU chip_id lines.
+
+---
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

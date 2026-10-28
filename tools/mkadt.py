@@ -187,6 +187,15 @@ def build(seed=None, qemu=False, highmem=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
+        ]),
+        # Adreno 618: SweetAccelerator (AGXAccelerator) matches sweet,gpu when
+        # sweetgpu>=3. Nub is always published; the driver decides whether to
+        # registerService. See docs/GPU.md.
+        node('gpu', [
+            ph(),
+            ('device_type', cstr('gpu')),
+            ('compatible', cstr('sweet,gpu') + cstr('qcom,adreno-618.0')),
+            ('reg', u64(0x05000000 - SOC_BASE, 0x40000)),
         ])])
 
     fbcon = node('sweet-fbcon', [

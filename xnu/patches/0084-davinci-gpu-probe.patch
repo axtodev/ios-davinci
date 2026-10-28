@@ -1,0 +1,184 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,153 @@
++/*
++ * DAVINCI / SWEET: Adreno 618 bring-up, step 0 - read-only state probe.
++ *
++ * Mi 9T (davinci) and Note 10 Pro (sweet) share the SM7150-class GPU:
++ * Adreno 618 at 0x05000000 with GMU, SMMU and GPUCC (sc7180-compatible).
++ * Addresses and GDSC/CBCR offsets come from Linux sm7150.dtsi,
++ * gcc-sm7150.c and gpucc-sc7180.c. See docs/GPU.md.
++ *
++ * Same safety rule as sweet_usb_probe: never read a block whose power
++ * domain or clocks look gated (an access hangs the SoC). This probe
++ * only reports what ABL / fastboot left behind; it does not enable the
++ * GPU. Boot-arg sweetgpu=0 disables it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GCC_PA                  0x00100000u
++#define GCC_SIZE                0x00090000u
++#define CBCR_CLK_OFF            (1u << 31)
++
++#define GCC_DDRSS_GPU_AXI       0x4452cu
++#define GCC_GPU_CFG_AHB         0x71004u
++#define GCC_GPU_MEMNOC_GFX      0x7100cu
++#define GCC_GPU_SNOC_DVM_GFX    0x71014u
++
++#define GPUCC_PA                0x05090000u
++#define GPUCC_SIZE              0x00009000u
++#define GPUCC_GX_GDSCR          0x100cu
++#define GPUCC_CX_GDSCR          0x106cu
++#define GPUCC_CXO_AON_CBCR      0x1004u
++#define GPUCC_CRC_AHB_CBCR      0x107cu
++#define GPUCC_CX_SNOC_DVM_CBCR  0x108cu
++#define GPUCC_CX_GMU_CBCR       0x1098u
++#define GPUCC_CXO_CBCR          0x109cu
++#define GDSC_PWR_ON             (1u << 31)
++
++#define GPU_PA                  0x05000000u
++#define GPU_SIZE                0x00040000u
++#define REG_A6XX_RBBM_CHIP_ID   0x0000u
++#define REG_A6XX_RBBM_STATUS    0x0210u /* freedreno/msm a6xx.xml */
++
++#define GMU_PA                  0x0506a000u
++#define GMU_SIZE                0x00001000u /* probe window only; no GMU reg reads yet */
++
++static const struct {
++	const char *name;
++	uint32_t    off;
++} gpu_gcc_cbcr[] = {
++	{ "cfg-ahb",     GCC_GPU_CFG_AHB },
++	{ "memnoc-gfx",  GCC_GPU_MEMNOC_GFX },
++	{ "snoc-dvm",    GCC_GPU_SNOC_DVM_GFX },
++	{ "ddrss-axi",   GCC_DDRSS_GPU_AXI },
++};
++
++static const struct {
++	const char *name;
++	uint32_t    off;
++} gpu_cc_cbcr[] = {
++	{ "cxo-aon",    GPUCC_CXO_AON_CBCR },
++	{ "crc-ahb",    GPUCC_CRC_AHB_CBCR },
++	{ "cx-snoc",    GPUCC_CX_SNOC_DVM_CBCR },
++	{ "cx-gmu",     GPUCC_CX_GMU_CBCR },
++	{ "cxo",        GPUCC_CXO_CBCR },
++};
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int enabled = 1;
++	uint32_t gcc_cbcr[sizeof(gpu_gcc_cbcr) / sizeof(gpu_gcc_cbcr[0])];
++	uint32_t cx_gdsc, gx_gdsc;
++	bool cx_on, cfg_on, memnoc_on;
++
++	PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	printf("SWEET GPU: Adreno 618 probe (davinci/sweet SM7150)\n");
++	for (unsigned i = 0; i < sizeof(gpu_gcc_cbcr) / sizeof(gpu_gcc_cbcr[0]); i++) {
++		gcc_cbcr[i] = gpu_rd(gcc, gpu_gcc_cbcr[i].off);
++		printf("SWEET GPU: gcc %-10s CBCR 0x%08x (%s)\n",
++		    gpu_gcc_cbcr[i].name, gcc_cbcr[i],
++		    (gcc_cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++	}
++	cfg_on = !(gcc_cbcr[0] & CBCR_CLK_OFF);
++	memnoc_on = !(gcc_cbcr[1] & CBCR_CLK_OFF);
++
++	/*
++	 * GPUCC sits in the always-reachable GPU config aperture on this
++	 * family; reading GDSCR / CBCRs here matches what Linux does before
++	 * voting the rails. If a future SoC hangs, gate this behind cfg_on.
++	 */
++	vm_offset_t gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (gpucc == 0) {
++		printf("SWEET GPU: GPUCC map failed\n");
++		return;
++	}
++	cx_gdsc = gpu_rd(gpucc, GPUCC_CX_GDSCR);
++	gx_gdsc = gpu_rd(gpucc, GPUCC_GX_GDSCR);
++	cx_on = (cx_gdsc & GDSC_PWR_ON) != 0;
++	printf("SWEET GPU: GDSC cx 0x%08x (%s) gx 0x%08x (%s)\n",
++	    cx_gdsc, cx_on ? "on" : "off",
++	    gx_gdsc, (gx_gdsc & GDSC_PWR_ON) ? "on" : "off");
++	for (unsigned i = 0; i < sizeof(gpu_cc_cbcr) / sizeof(gpu_cc_cbcr[0]); i++) {
++		uint32_t v = gpu_rd(gpucc, gpu_cc_cbcr[i].off);
++		printf("SWEET GPU: gpucc %-8s CBCR 0x%08x (%s)\n",
++		    gpu_cc_cbcr[i].name, v,
++		    (v & CBCR_CLK_OFF) ? "off" : "on");
++	}
++
++	if (!cx_on || !cfg_on || !memnoc_on) {
++		printf("SWEET GPU: CX/clks gated; GPU/GMU MMIO not read "
++		    "(expected after fastboot)\n");
++		return;
++	}
++
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (gpu == 0) {
++		printf("SWEET GPU: GPU map failed\n");
++		return;
++	}
++	printf("SWEET GPU: RBBM_CHIP_ID 0x%08x RBBM_STATUS 0x%08x\n",
++	    gpu_rd(gpu, REG_A6XX_RBBM_CHIP_ID),
++	    gpu_rd(gpu, REG_A6XX_RBBM_STATUS));
++
++	/* Map only: GMU register layout is confirmed in phase 1 with fw docs. */
++	if (ml_io_map(GMU_PA, GMU_SIZE) == 0) {
++		printf("SWEET GPU: GMU map failed\n");
++		return;
++	}
++	printf("SWEET GPU: GMU aperture mapped at 0x%08x (no reg reads yet)\n",
++	    GMU_PA);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
