@@ -2,12 +2,49 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-28 (GPU acceleration - read first) <<<
+### >>> UPDATE 2026-10-29 (GPU acceleration - read first) <<<
 
-**GOAL:** Adreno 618 bring-up on davinci. Patches 0084 (probe) + 0085 (CX power-on / optional AGX stub). See docs/GPU.md. Boot with sweetgpu=2 first; sweetgpu=3 only for selector traces.
+**Two tracks, see docs/GPU.md.** The big finding: iOS ships *precompiled AGX
+machine code* (`default.metallib` in every framework), so a Metal/IOAccelerator
+driver for Adreno would need AGX→a6xx binary translation. Filling the
+IOAccelerator gap alone will NOT move existing apps off `CA::OGL::SW`. What is
+truly slow today is the CPU present path, so that is the active work.
 
-**CI:** pushed branch gpu-bringup to axtodev/ios-davinci (649e1e2+). Workflow run 40772702186 FAILED: GitHub account locked for billing, job never started. Upstream PR: https://github.com/Antcating/ios-davinci/pull/2
-**NEXT:** unlock GitHub billing / Actions on axtodev, re-run: gh workflow run xnu.yml --ref gpu-bringup. Then fastboot boot with sweetgpu=2.
+**Track A (active) = patch 0086 `sweet-fb-present-pacing.patch`.** Reworks
+`iokit/Kernel/arm/SweetFramebuffer.cpp` (on top of 0046+0054+0056+0061+0067+0079):
+- panel copy moved out of `vsyncFired()` into its own `IOWorkLoop`+timer, so vsync
+  notifications are no longer delayed by a copy;
+- `sweetfb_hz` now = present period, **default 60** (was a 10 Hz tick divider),
+  adaptive: period ≥ 3x measured copy time, cap 50 ms;
+- new boot-arg `sweetfb_cache=1` = map the panel with `kIOMapCopybackCache` and
+  flush with `dc cvac`/`dsb sy` (display controller is not cache coherent);
+  default stays write-combined;
+- log every 120 presents: `SWEET FB: present N <us> <KB> <MB/s> every <us>`;
+- `SwapWait` logs its first 8 calls (proc, scalar inputs, presented count).
+- Verified only by patch replay (`tools/reconstruct-file.py`, byte-identical),
+  NOT compiled - no CI.
+
+**Track B = 0084 (probe) + 0085 (CX power-on / AGX stub), still unbuilt.** Two
+fixes are in the text after checking Linux `gpucc-sc7180.c`: GX GDSC cannot be
+powered from the CPU at all (`gdsc_gx_do_nothing_enable`, GMU only), and the
+`CX_GMU` CBCR `0x1098` needs its sleep/wake fields (bits 4-11 = 0xF) set before
+the enable sticks.
+
+**Firmware (user said the Android vendor partition is still intact):**
+`tools/gpu-fw.py` pulls GMU firmware / SQE / ZAP into `fw/` (gitignored) with
+`fw/manifest.txt` (sha256+size) and labels each file. NOT run yet: no adb device
+and no fastboot device attached (`adb devices` empty). Run it with the phone
+booted in Android, or in OrangeFox after mounting /vendor (`--local DIR` works
+too).
+
+**CI is still dead:** run 40870155593 (ref gpu-bringup) died with "The job was not
+started because your account is locked due to a billing issue" - same as
+40772702186. Nothing kernel-side can be compiled until billing is cleared on the
+axtodev account, which only the user can do. Then:
+`gh workflow run xnu.yml --ref gpu-bringup` → build images → boot
+`fastboot boot shim/out/shim-boot-0086*.img` with `sweetfb_hz=60` first, then
+again with `sweetfb_cache=1`, and compare the `SWEET FB: present` lines.
+Upstream PR: https://github.com/Antcating/ios-davinci/pull/2
 
 ---
 

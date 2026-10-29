@@ -1,0 +1,336 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6dc94c8..1a993e3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -24,10 +24,14 @@
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+- * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+- * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+- * enabled it, through the port they registered (IOConnectSetNotificationPort).
++ * SwapEnd only records the frame. A second 60 Hz timer, on its own work loop,
++ * copies the enabled layers' surfaces into the panel memory (no scaling, CPU
++ * copy) and stretches its period to whatever the measured copy cost allows
++ * (boot-arg sweetfb_hz caps the rate). Vsync (notification type 5) is a
++ * separate 60 Hz timer that only sends (count, mach_absolute_time, 0) as
++ * 32-bit halves to clients that enabled it, through the port they registered
++ * (IOConnectSetNotificationPort), so a slow copy cannot delay CoreAnimation's
++ * frame pacing.
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -93,11 +97,14 @@ class IOMobileFramebufferUserClient;
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+-	IOWorkLoop         *fWorkLoop;
++	IOWorkLoop         *fWorkLoop;         /* vsync notifications */
+ 	IOTimerEventSource *fVsync;
++	IOWorkLoop         *fPresentLoop;      /* panel copies */
++	IOTimerEventSource *fPresentTimer;
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -113,7 +120,11 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fPeriodUS;      /* present period cap, from sweetfb_hz */
++	uint64_t      fPresents;      /* panel copies done */
++	uint64_t      fCopyUs;        /* duration of the last panel copy */
++	uint64_t      fFrameBytes;    /* bytes the last present copied */
++	uint32_t      fCacheMode;     /* 1 = cached panel mapping + dc cvac */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -180,9 +191,33 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/*
++	 * Write-combined stores into the panel run at a few GB/s at best: a
++	 * 1080x2340 frame then costs several milliseconds per present. A cached
++	 * mapping plus an explicit clean (dc cvac) is much faster because the
++	 * copy runs at memory bandwidth; the display controller is not cache
++	 * coherent, hence the flush in present(). sweetfb_cache=1 selects it.
++	 */
++	fCacheMode = 0;
++	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
++	if (fCacheMode == 1 && fSurface != NULL) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
++		fMap = md != NULL ? md->map(kIOMapCopybackCache) : NULL;
++		OSSafeReleaseNULL(md);
++		if (fMap != NULL && fMap->getVirtualAddress() != 0) {
++			fPixels = (uintptr_t)fMap->getVirtualAddress();
++			IOLog("SWEET FB: panel copy through a cached mapping + cvac\n");
++		} else {
++			fCacheMode = 0;
++			IOLog("SWEET FB: cached panel mapping failed, keeping write-combined\n");
++			OSSafeReleaseNULL(fMap);
++		}
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
++		OSSafeReleaseNULL(fMap);
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+@@ -192,17 +227,31 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fPeriodUS = (hz == 0 || hz > 240) ? SWEET_FB_VSYNC_US : 1000000u / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/*
++	 * The panel copy gets its own work loop and timer, so the vsync
++	 * notifications above stay on time whatever a copy costs.
++	 */
++	fPresentLoop = IOWorkLoop::workLoop();
++	fPresentTimer = fPresentLoop != NULL ?
++	    IOTimerEventSource::timerEventSource(this, &AppleCLCD::presentFired) : NULL;
++	if (fPresentTimer == NULL ||
++	    fPresentLoop->addEventSource(fPresentTimer) != kIOReturnSuccess) {
++		IOLog("SWEET FB: no present timer\n");
++		return false;
++	}
++	fPresentTimer->setTimeoutUS(fPeriodUS);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, "
++	    "presented as %ux%u, copy every %u us\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS);
+ 	return true;
+ }
+ 
+@@ -224,39 +273,109 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
+-		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
++	IOLockUnlock(fb->fLock);
++	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++}
++
++/* Microseconds since start, for the present cost report. */
++static uint32_t
++sweet_fb_elapsed_us(uint64_t start)
++{
++	uint64_t delta = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &delta);
++	return delta > 1000000000ULL ? 1000000000u : (uint32_t)(delta / 1000);
++}
++
++/*
++ * Clean the lines of a just-written panel region: the display controller is
++ * not cache coherent. dc cvac (clean, keep the line) rather than civac, so a
++ * dirty line someone else holds through another mapping is not discarded.
++ */
++static void
++sweet_fb_clean_rows(uintptr_t dst, size_t row, int32_t h, uint32_t stride)
++{
++	uint64_t ctr;
++	size_t line;
++
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	line = (size_t)4 << ((ctr >> 16) & 0xf);
++	for (int32_t y = 0; y < h; y++) {
++		uintptr_t start = dst + (uint64_t)y * stride;
++		uintptr_t p = start & ~(uintptr_t)(line - 1);
++		uintptr_t end = start + row;
++
++		for (; p < end; p += line) {
++			__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
+ 		}
+-		IOLockUnlock(fb->fLock);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Panel copy, on its own work loop. The period follows the measured cost:
++ * a copy may use about a third of the frame period, so a slow mapping
++ * (write-combined stores run at a few GB/s at best) costs update rate
++ * instead of CPU. sweetfb_hz caps the rate from above.
++ */
++void
++AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	bool dirty, off;
++	uint32_t step, period;
++
++	IOLockLock(fb->fLock);
++	dirty = fb->fDirty;
++	if (dirty) {
++		memcpy(rec, fb->fPending, sizeof(rec));
++		fb->fDirty = false;
++	}
++	off = fb->fPowerOff;
++	step = fb->fFadeStep;
++	if (off && step <= 6) {
++		fb->fFadeStep = step + 1;
++	}
++	IOLockUnlock(fb->fLock);
++
++	if (off) {
++		/* Fade out: halve every channel each step, then black, then idle. */
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels +
++				    (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			if (fb->fCacheMode != 0) {
++				sweet_fb_clean_rows(fb->fPixels, (size_t)fb->fWidth * 4,
++				    (int32_t)fb->fHeight, fb->fRowBytes);
++			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+-		return;
++	} else if (dirty) {
++		uint64_t start = mach_absolute_time();
++		fb->fFrameBytes = 0;
++		fb->present(rec);
++		fb->fCopyUs = sweet_fb_elapsed_us(start);
++		fb->fPresents++;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
++
++	period = fb->fPeriodUS;
++	if (fb->fCopyUs * 3 > (uint64_t)period) {
++		uint64_t want = fb->fCopyUs * 3;
++		period = (uint32_t)(want > 50000 ? 50000 : want);
+ 	}
+-	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	if ((fb->fPresents % 120) == 0 && fb->fPresents != 0) {
++		uint64_t mbps = fb->fCopyUs != 0 ?
++		    (fb->fFrameBytes * 1000000ULL) / (fb->fCopyUs * (1024ULL * 1024ULL)) : 0;
++		IOLog("SWEET FB: present %llu %u us %llu KB %llu MB/s every %u us\n",
++		    (unsigned long long)fb->fPresents, (uint32_t)fb->fCopyUs,
++		    (unsigned long long)(fb->fFrameBytes / 1024),
++		    (unsigned long long)mbps, period);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(period);
+ }
+ 
+ void
+@@ -289,12 +408,12 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+- * A swap only records the frame: copying 10 MB into the panel on every
+- * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+- * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+- * default 10 Hz).
++ * A swap only records the frame: copying 10 MB into the panel on every swap
++ * (backboardd presents at 60 Hz) took the whole CPU, and doing it on the
++ * vsync work loop also delayed the notifications back to CoreAnimation.
++ * presentFired() does the copy and the cost report; swap() stays a small
++ * memcpy under the lock.
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+@@ -308,6 +427,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/* Copy each enabled layer's surface into the panel memory (no scaling). */
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -391,10 +511,23 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			size_t row = (size_t)w * 4;
++			uintptr_t dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			const uint8_t *from = (const uint8_t *)(src + s->offset +
++			    (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4);
++
++			fFrameBytes += (uint64_t)row * (uint64_t)h;
++			if (row == fRowBytes && row == s->bytesPerRow) {
++				/* Full-width layer: one big memcpy beats per-row calls. */
++				memcpy((void *)dst, from, row * (size_t)h);
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(dst + (uint64_t)y * fRowBytes),
++					    from + (uint64_t)y * s->bytesPerRow, row);
++				}
++			}
++			if (fCacheMode != 0) {
++				sweet_fb_clean_rows(dst, row, h, fRowBytes);
+ 			}
+ 		}
+ 		s->release();
+@@ -545,7 +678,26 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+-	case kSweetFBSwapWait:
++	case kSweetFBSwapWait: {
++		/*
++		 * Returns at once: whether CoreAnimation passes a swap id (and a
++		 * timeout) here decides whether blocking would pace the present
++		 * loop better. Log the first calls, do not guess the ABI.
++		 */
++		static uint32_t sweet_fb_wait_logged;
++		if (sweet_fb_wait_logged < 8) {
++			sweet_fb_wait_logged++;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET FB: %s SwapWait in %u %llu %llu %llu (presented %llu)\n",
++			    name, args->scalarInputCount,
++			    args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL,
++			    args->scalarInputCount > 1 ? (unsigned long long)args->scalarInput[1] : 0ULL,
++			    args->scalarInputCount > 2 ? (unsigned long long)args->scalarInput[2] : 0ULL,
++			    (unsigned long long)fFB->fPresents);
++		}
++		break;
++	}
+ 	default:
+ 		break;
+ 	}

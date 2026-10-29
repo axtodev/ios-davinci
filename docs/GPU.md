@@ -7,9 +7,68 @@ this work only owns the accelerator.
 
 Today CoreAnimation runs `CA::OGL::SW` (CPU). backboardd already polls
 `IOProviderClass IOAcceleratorES`, `AGXAccelerator` and
-`IOAcceleratorESLegacy` and finds nothing. Filling that gap with a driver
-that speaks enough of Apple's IOAccelerator / Metal ABI, and drives the
-Adreno through a freedreno-style backend, is the path to "iOS runs well".
+`IOAcceleratorESLegacy` and finds nothing.
+
+## Where this stands (2026-10-29)
+
+Two independent walls. Only one of them can be moved with kernel code:
+
+1. **Shaders are already machine code.** iOS ships precompiled AGX ISA
+   (`default.metallib` in QuartzCore / Metal / every framework, plus the
+   per-app `metallib`s). There is no shader source and no compiler we can
+   point at a6xx, so choosing `CA::OGL::MetalContext` would require
+   *translating* AGX machine code into a6xx machine code. A complete
+   IOAccelerator / Metal ABI implementation alone does not get there:
+   whatever we submit would still have to run AGX binaries. Treat this as
+   the long-term research track, not the next milestone.
+2. **The present path is the CPU.** Everything CoreAnimation draws is
+   copied into the panel by the CPU: `AppleCLCD::present()` does a
+   ~10 MB `memcpy` per frame into a write-combined mapping of the ABL
+   framebuffer (patch 0046), throttled to `sweetfb_hz` ticks. This is
+   where frames are lost today, and it needs no firmware, no TZ and no
+   shader translation.
+
+So the work splits:
+
+- **Track A, present path** (patch 0086). Raise the panel copy out of the
+  vsync timer, measure it, and offer a cached mapping. See below; this is
+  the active work.
+- **Track B, Adreno driver** (patches 0084/0085 and the phases below).
+  Power, GMU, ring, submit: the groundwork for Track A's successor (GPU
+  composition of the same IOSurfaces) and for compute offload, not a way
+  to make existing apps render on the GPU.
+
+## Track A — present path (patch 0086)
+
+Before 0086 the panel copy ran *inside* `vsyncFired()` on the same work
+loop that delivers vsync notifications, every `60/hz` ticks (default
+`sweetfb_hz=10`). Two consequences: at 10 Hz the GUI visibly stepped, and
+raising the rate moved the copy onto the CA pacing path.
+
+0086 changes:
+
+- second `IOWorkLoop` + `IOTimerEventSource` (`fPresentLoop` /
+  `fPresentTimer`): vsync notifications keep their own timer and stay on
+  time whatever a copy costs.
+- `sweetfb_hz` now means the present period directly (`1000000/hz` us,
+  default **60**); the period adapts up to 3x the measured copy time,
+  capped at 50 ms, so a slow mapping costs update rate, not CPU.
+- every 120 presents: `SWEET FB: present N <us> <KB> <MB/s> every <us>` -
+  the copy cost is now measured, not guessed.
+- `sweetfb_cache=1` maps the panel through `kIOMapCopybackCache` and
+  flushes the written lines with `dc cvac` + `dsb sy` (the display
+  controller is not cache coherent). Default stays write-combined; the
+  log above decides which one wins on real hardware.
+- one big `memcpy` when the layer row and the panel stride match, and the
+  copied byte count is reported instead of being implied.
+- `SwapWait` logs its first 8 calls (caller name, scalar inputs, presented
+  count) so CA pacing can be understood from the kernel log alone.
+
+Read the result like this: copy <= 5 ms means `sweetfb_hz=60` is honest;
+copy of 10-20 ms means write-combined stores are the limit and
+`sweetfb_cache=1` is the fix; a copy that never shrinks means the layer
+rect (the `w`,`h` in the swap record) is full-screen every time and dirty
+rects have to come from CA, not from us.
 
 ## Hardware map (SM7150 / Linux sm7150.dtsi)
 
@@ -39,9 +98,14 @@ Power: CX_GDSC + GX_GDSC. On a618 the GMU owns GX bring-up in the
 normal Linux path; a "force legacy / no GMU" path is a research option
 for early bring-up only.
 
-Firmware (later phases, keep out of git until needed): GMU fw + ZAP
-shader (`a615_zap`-class for a618). Source them from the device's
-Android vendor partition / linux-firmware, never commit blobs.
+Firmware: GMU firmware + SQE microcode + ZAP shader. The Mi 9T still has
+its Android vendor partition, which is the only licensed copy we may use;
+pull it with `python tools/gpu-fw.py` (adb, or `--local` for files already
+pulled). It lands in `fw/` (gitignored) with `fw/manifest.txt` holding
+size + sha256, and it prints which file is what. Blobs never enter git.
+The GMU firmware is loaded by the CPU through the GMU's own AHB window,
+so it is reachable; the ZAP shader is TZ-signed and is what
+`RBBM_SECVID_TRUST_CNTL` (`0x05000000 + 0xf000`) has to work around.
 
 ## Stack (target)
 
@@ -67,6 +131,11 @@ by backboardd.
 
 ## Phases
 
+Status 2026-10-29: 0084, 0085 and 0086 are written but **have never been
+compiled** - the GitHub Actions account is locked for billing, so every
+run fails before the job starts (see `NOTES.md`). Nothing below has run on
+the phone yet; treat the log formats as intent, not as observed output.
+
 ### Boot-arg `sweetgpu`
 
 | Value | Effect |
@@ -91,8 +160,18 @@ after fastboot; that still validates the probe.
 ### Phase 1 — power on + chip id (patch 0085, `sweetgpu=2`)
 
 Enable CX GDSC + CBCRs, read a stable chip id. GX stays off until a GMU
-firmware path exists (forcing GX without GMU is a hang risk). Sources of
-truth for the patch live in `tools/gpu-src/` (`gen_0085_patch.py`).
+firmware path exists. Sources of truth for the patch live in
+`tools/gpu-src/` (`gen_0085_patch.py`).
+
+Two corrections from the sc7180 driver (already in the patch text, worth
+knowing when debugging it):
+
+- GX GDSC is **not** CPU-controllable on a6xx: `gpucc-sc7180.c` registers
+  it with `gdsc_gx_do_nothing_enable` because only the GMU may power the
+  core domain. Forcing GX from the CPU is a hang, not a shortcut.
+- The `CX_GMU` branch (`0x1098`) is a CBCR with sleep/wake fields: bits
+  4-11 must carry `0xF` (both sides) before the enable bit sticks. Writing
+  the enable alone reads back as off.
 
 ### Phase 2 — IOKit stub + selector trace (patch 0085, `sweetgpu=3`)
 
@@ -115,14 +194,17 @@ produces frames. Measure fps vs today's ~20–30 CPU path.
 
 ### Phase 5 — broaden
 
-Shaders, compute, apps. Long tail; only after Phase 4 is stable.
+Shaders, compute, apps. Long tail; only after Phase 4 is stable, and it
+inherits the AGX-ISA problem described at the top of this file.
 
 ## Non-goals (for now)
 
 - MDP/DPU-only composition as a substitute for Metal (useful later as a
   present helper, not the main plan).
-- Shipping GPU firmware in this repo.
-- Touching display bring-up or replacing `AppleCLCD`.
+- Shipping GPU firmware in this repo (`fw/` is gitignored).
+- Changing display bring-up. Track A edits the present path inside
+  `AppleCLCD`, but the panel/ABL framebuffer setup and the 1125x2436
+  presentation stay as they are (patches 0046-0079).
 
 ## References
 

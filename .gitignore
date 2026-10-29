@@ -2,6 +2,9 @@
 backup/
 dtb/
 recovery/
+# GPU firmware pulled off the vendor partition (tools/gpu-fw.py): not
+# redistributable, keep it local
+fw/
 # third-party/Apple sources fetched for reading
 research/
 shim/out/
