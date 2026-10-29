@@ -37,13 +37,18 @@ and no fastboot device attached (`adb devices` empty). Run it with the phone
 booted in Android, or in OrangeFox after mounting /vendor (`--local DIR` works
 too).
 
-**CI is still dead:** run 40870155593 (ref gpu-bringup) died with "The job was not
-started because your account is locked due to a billing issue" - same as
-40772702186. Nothing kernel-side can be compiled until billing is cleared on the
-axtodev account, which only the user can do. Then:
-`gh workflow run xnu.yml --ref gpu-bringup` → build images → boot
-`fastboot boot shim/out/shim-boot-0086*.img` with `sweetfb_hz=60` first, then
-again with `sweetfb_cache=1`, and compare the `SWEET FB: present` lines.
+**CI is still dead (but flickered):** run 40877718547 (ref gpu-bringup,
+2026-10-29) is the first one this month that got *past* the billing check -
+it queued 15m02s and then failed with "The job was not acquired by Runner of
+type hosted even after multiple attempts" (macOS arm64 capacity). A rerun of
+the same commit went back to "The job was not started because your account is
+locked due to a billing issue". So 0084/0085 still have never been compiled and
+0086 has never been compiled either. Only the user can clear billing on the
+axtodev account. Then:
+`gh workflow run xnu.yml --ref gpu-bringup` (or `gh run rerun 40877718547`) →
+build images → boot `fastboot boot shim/out/shim-boot-0086*.img` with
+`sweetfb_hz=60` first, then again with `sweetfb_cache=1`, and compare the
+`SWEET FB: present` lines.
 Upstream PR: https://github.com/Antcating/ios-davinci/pull/2
 
 ---

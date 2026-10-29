@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 6dc94c8..1a993e3 100644
+index 6dc94c8..88d2803 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -24,10 +24,14 @@
@@ -21,7 +21,15 @@ index 6dc94c8..1a993e3 100644
   *
   * The panel memory itself is published as an IOSurface and returned as the
   * default framebuffer surface. The kernel text console keeps drawing over
-@@ -93,11 +97,14 @@ class IOMobileFramebufferUserClient;
+@@ -41,6 +45,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+@@ -93,11 +98,14 @@ class IOMobileFramebufferUserClient;
  class AppleCLCD : public IOMobileFramebuffer {
  	OSDeclareDefaultStructors(AppleCLCD);
  
@@ -37,7 +45,7 @@ index 6dc94c8..1a993e3 100644
  
  public:
  	uint64_t      fPhys;
-@@ -113,7 +120,11 @@ public:
+@@ -113,7 +121,11 @@ public:
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
@@ -50,7 +58,7 @@ index 6dc94c8..1a993e3 100644
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
  
-@@ -180,9 +191,33 @@ AppleCLCD::start(IOService *provider)
+@@ -180,9 +192,33 @@ AppleCLCD::start(IOService *provider)
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
  	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
@@ -84,7 +92,7 @@ index 6dc94c8..1a993e3 100644
  		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
  		OSSafeReleaseNULL(fWorkLoop);
  		return false;
-@@ -192,17 +227,31 @@ AppleCLCD::start(IOService *provider)
+@@ -192,17 +228,31 @@ AppleCLCD::start(IOService *provider)
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -120,7 +128,7 @@ index 6dc94c8..1a993e3 100644
  	return true;
  }
  
-@@ -224,39 +273,109 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -224,39 +274,109 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -252,7 +260,7 @@ index 6dc94c8..1a993e3 100644
  }
  
  void
-@@ -289,12 +408,12 @@ get32(const uint8_t *p, uint32_t off)
+@@ -289,12 +409,12 @@ get32(const uint8_t *p, uint32_t off)
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -270,7 +278,7 @@ index 6dc94c8..1a993e3 100644
   */
  void
  AppleCLCD::swap(const uint8_t *rec)
-@@ -308,6 +427,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -308,6 +428,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  }
  
@@ -278,7 +286,7 @@ index 6dc94c8..1a993e3 100644
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -391,10 +511,23 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -391,10 +512,23 @@ AppleCLCD::present(const uint8_t *rec)
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -306,7 +314,7 @@ index 6dc94c8..1a993e3 100644
  			}
  		}
  		s->release();
-@@ -545,7 +678,26 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -545,7 +679,26 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
