@@ -24,7 +24,7 @@
      "     'IOClass'         = IOPanicPlatform;"
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1,153 +1,276 @@
+@@ -1,153 +1,279 @@
 -/*
 - * DAVINCI / SWEET: Adreno 618 bring-up, step 0 - read-only state probe.
 - *
@@ -207,6 +207,9 @@
 +#define GCC_SIZE                0x00090000u
 +#define CBCR_CLK_OFF            (1u << 31)
 +#define CBCR_ENABLE             (1u << 0)
++/* Branches with halt/sleep fields (CX_GMU) only switch on when both sides
++ * are set: the hardware waits for a wake pulse. */
++#define CBCR_SLEEP_WAKE         ((0xfu << 4) | (0xfu << 8))
 +
 +#define GCC_DDRSS_GPU_AXI       0x4452cu
 +#define GCC_GPU_CFG_AHB         0x71004u
@@ -316,10 +319,10 @@
 +}
 +
 +static bool
-+gpu_cbcr_enable(vm_offset_t base, uint32_t off, const char *name)
++gpu_cbcr_enable(vm_offset_t base, uint32_t off, uint32_t extra, const char *name)
 +{
 +	uint32_t v = gpu_rd(base, off);
-+	gpu_wr(base, off, v | CBCR_ENABLE);
++	gpu_wr(base, off, v | CBCR_ENABLE | extra);
 +	for (int i = 0; i < 1000; i++) {
 +		v = gpu_rd(base, off);
 +		if (!(v & CBCR_CLK_OFF)) {
@@ -358,22 +361,22 @@
 +	 * Order follows Linux msm/a6xx + gpucc: iface clocks, then CX GDSC,
 +	 * then GMU/CXO branches. GX stays off until a GMU path exists.
 +	 */
-+	if (!gpu_cbcr_enable(g_gcc, GCC_GPU_CFG_AHB, "cfg-ahb") ||
-+	    !gpu_cbcr_enable(g_gcc, GCC_GPU_MEMNOC_GFX, "memnoc-gfx") ||
-+	    !gpu_cbcr_enable(g_gcc, GCC_GPU_SNOC_DVM_GFX, "snoc-dvm") ||
-+	    !gpu_cbcr_enable(g_gcc, GCC_DDRSS_GPU_AXI, "ddrss-axi")) {
++	if (!gpu_cbcr_enable(g_gcc, GCC_GPU_CFG_AHB, 0, "cfg-ahb") ||
++	    !gpu_cbcr_enable(g_gcc, GCC_GPU_MEMNOC_GFX, 0, "memnoc-gfx") ||
++	    !gpu_cbcr_enable(g_gcc, GCC_GPU_SNOC_DVM_GFX, 0, "snoc-dvm") ||
++	    !gpu_cbcr_enable(g_gcc, GCC_DDRSS_GPU_AXI, 0, "ddrss-axi")) {
 +		return false;
 +	}
-+	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CXO_AON_CBCR, "cxo-aon") ||
-+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CRC_AHB_CBCR, "crc-ahb") ||
-+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CX_SNOC_DVM_CBCR, "cx-snoc")) {
++	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CXO_AON_CBCR, 0, "cxo-aon") ||
++	    !gpu_cbcr_enable(g_gpucc, GPUCC_CRC_AHB_CBCR, 0, "crc-ahb") ||
++	    !gpu_cbcr_enable(g_gpucc, GPUCC_CX_SNOC_DVM_CBCR, 0, "cx-snoc")) {
 +		return false;
 +	}
 +	if (!gpu_cx_enable()) {
 +		return false;
 +	}
-+	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CX_GMU_CBCR, "cx-gmu") ||
-+	    !gpu_cbcr_enable(g_gpucc, GPUCC_CXO_CBCR, "cxo")) {
++	if (!gpu_cbcr_enable(g_gpucc, GPUCC_CX_GMU_CBCR, CBCR_SLEEP_WAKE, "cx-gmu") ||
++	    !gpu_cbcr_enable(g_gpucc, GPUCC_CXO_CBCR, 0, "cxo")) {
 +		return false;
 +	}
 +	return true;
