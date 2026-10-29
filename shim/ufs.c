@@ -15,6 +15,20 @@
 
 #define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
 
+/*
+ * Name compare for the partition table. __builtin_strcmp is a call to strcmp
+ * with clang (there is no libc here), so compare by hand instead.
+ */
+static int
+name_is(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return (unsigned char)*a - (unsigned char)*b;
+}
+
 #define REG_CAP		0x00
 #define REG_VER		0x08
 #define REG_IS		0x20
@@ -186,8 +200,8 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
-		if (!__builtin_strcmp(name, "userdata") || !__builtin_strcmp(name, "cust") ||
-		    !__builtin_strcmp(name, "cache"))
+		if (!name_is(name, "userdata") || !name_is(name, "cust") ||
+		    !name_is(name, "cache"))
 			con_str(" fs", fs_type((uint32_t)first));
 	}
 }

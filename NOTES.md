@@ -50,6 +50,32 @@ account. Then:
 build images → boot `fastboot boot shim/out/shim-boot-0086*.img` with
 `sweetfb_hz=60` first, then again with `sweetfb_cache=1`, and compare the
 `SWEET FB: present` lines.
+**Build path without bash (2026-10-29, later):** `tools/make-boot.py` now does
+what `shim/build.sh` needs a POSIX shell, gawk, gtruncate, cpio and
+`aosp-mkbootimg` for: compile with LLVM (`clang --target=aarch64-none-elf
+-fuse-ld=lld`) and pack the boot v2 header in Python. Working on this Windows
+PC, which has neither bash nor a toolchain other than LLVM 22.1.8:
+`python tools/make-boot.py --cc "C:\Program Files\LLVM\bin\clang.exe" --objcopy ... --nm ... --readelf ...llvm-objdump.exe shim/out/shim-boot-test.img`
+-> `Image` 184320 B, image 192512 B (4096 header + kernel + 49 B empty cpio).
+`tools/unpack_bootv2.py` reads it back cleanly (kernel 0x8000, ramdisk
+0x1000000, tags 0x100, dtb 0x1f00000, v2, `console=null`) and the embedded
+ARM64 header is right (code0 `b +0x800`, image_size 0x2d000, flags 0xa, magic
+`ARM\x64`). Two clang traps, both fixed:
+- `-fno-jump-tables` is mandatory: `exc_handler`'s switch turns into
+  `.Lswitch.table` with 4 `R_AARCH64_ABS64` entries, and the shim has no
+  relocation pass. The tool now refuses any object with ABS64 outside start.S.
+- `shim/ufs.c` must not use `__builtin_strcmp` (clang emits a real `strcmp`
+  call; `-fno-builtin` does not stop it): it uses a local `name_is()` now.
+No `dtb/davinci.dtb` yet, so the test image carries no DTB; grab it from the
+phone's `boot` partition (`tools/unpack_bootv2.py`) once adb works.
+
+**What can be flashed today is only the diagnostics image** - there is no XNU
+kernel anywhere on this PC (no `xnu/out*`), so `--payload` has nothing to take.
+`tools/xnu-ci-retry.py 6 600` is rewatching CI in the background (dispatch ->
+poll -> `gh run download -n xnu-kernel -D xnu/out-<stamp>`, retry on failure);
+latest attempt dispatched 40891711725. Phone was not attached at 14:45
+(`adb devices` and `fastboot devices` both empty).
+
 Upstream PR: https://github.com/Antcating/ios-davinci/pull/2
 
 ---
