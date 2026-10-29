@@ -41,10 +41,11 @@ too).
 2026-10-29) is the first one this month that got *past* the billing check -
 it queued 15m02s and then failed with "The job was not acquired by Runner of
 type hosted even after multiple attempts" (macOS arm64 capacity). A rerun of
-the same commit went back to "The job was not started because your account is
-locked due to a billing issue". So 0084/0085 still have never been compiled and
-0086 has never been compiled either. Only the user can clear billing on the
-axtodev account. Then:
+the same commit, and a fresh dispatch 40881844236 (after b71aee0), went back
+to "The job was not started because your account is locked due to a billing
+issue" (5m06s). So 0084/0085 still have never been compiled and 0086 has
+never been compiled either. Only the user can clear billing on the axtodev
+account. Then:
 `gh workflow run xnu.yml --ref gpu-bringup` (or `gh run rerun 40877718547`) →
 build images → boot `fastboot boot shim/out/shim-boot-0086*.img` with
 `sweetfb_hz=60` first, then again with `sweetfb_cache=1`, and compare the
